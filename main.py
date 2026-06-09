@@ -37,20 +37,46 @@ class Control:
         self.X_points = []
         self.control_rate = 10  # hz
         self.wheel_base = 2.7
+        self.cruise_speed = 10.0
+        self.tuning = {
+            "road_width": 3.0,
+            "vehicle_half_width": 0.9,
+            "min_crawl_speed": 1.0,
+            "follow_time_gap": 1.2,
+            "safe_distance": 8.0,
+            "warning_distance": 15.0,
+            "emergency_stop_distance": 2.5,
+            "meeting_distance": 12.0,
+            "blockage_trigger_distance": 10.0,
+            "blockage_timeout": 4.0,
+            "blockage_speed_threshold": 0.6,
+            "escape_reverse_speed": -1.5,
+            "escape_forward_speed": 1.5,
+            "escape_turn_rate": 0.2,
+            "escape_reverse_duration": 1.5,
+            "escape_borrow_duration": 2.0,
+            "escape_straighten_duration": 1.2,
+            "escape_side_clearance_margin": 0.4,
+            "rear_safety_distance": 4.0,
+        }
+        self.deadlock_start_time = None
+        self.blockage_start_time = None
+        self.escape_state = None
+        self.escape_state_start_time = None
+        self.escape_direction = 1
+        self.escape_target_name = None
 
     def control_node(self):
         start_time = time.time()
         self.load_route('exp_routes/Big.json')
 
         # 初始化状态变量
-        self.deadlock_start_time = None
-
         while True:
             vehicle_data = self.udp_client.get_vehicle_state()
             self.m_x = vehicle_data.x
             self.m_y = vehicle_data.y
             self.m_yaw = vehicle_data.yaw / 180 * math.pi
-            self.m_v = 10
+            self.m_v = max(getattr(vehicle_data, 'speed', 0.0), 0.0)
             self.update_vehpos_index()
             self.search_target_pos()
 
@@ -77,6 +103,7 @@ class Control:
             if v > 3:  # 只有在正常行驶时才考虑超车
                 v, w = self.slow_vehicle_overtaking(self.m_x, self.m_y, self.m_yaw, v, w)
 
+            v, w = self.persistent_blockage_recovery(self.m_x, self.m_y, self.m_yaw, v, w)
             self.udp_client.send_control_command(v, w)
 
             elapsed_time = time.time() - start_time
@@ -106,6 +133,9 @@ class Control:
         self.X_points = [float(x) for x in self.X_points]
         self.Y_points = [float(y) for y in self.Y_points]
 
+    def get_param(self, name):
+        return self.tuning[name]
+
     def calc_pure_pursuit(self, m_x, m_y, m_yaw, target_pos):
         ###################################
         ##输出控制：速度（v）和转向角（steering_angle）
@@ -131,11 +161,178 @@ class Control:
             steering_angle = 0
 
         # 速度控制（可根据曲率或前视距离调整，这里使用固定速度）
-        v = self.m_v
+        v = self.cruise_speed
 
         ###################################
         w = v * math.tan(steering_angle) / self.wheel_base
         return v, w
+
+    @staticmethod
+    def normalize_angle(angle):
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        return angle
+
+    def project_to_vehicle_frame(self, dx, dy, yaw):
+        longitudinal = dx * math.cos(yaw) + dy * math.sin(yaw)
+        lateral = -dx * math.sin(yaw) + dy * math.cos(yaw)
+        return longitudinal, lateral
+
+    def find_closest_vehicle_in_corridor(self, m_x, m_y, m_yaw, max_distance, half_width, max_heading_diff):
+        closest_vehicle = None
+        closest_longitudinal = float('inf')
+        closest_lateral = 0.0
+
+        for other in self.udp_client.get_neighbor_vehicle_state():
+            dx = other.x - m_x
+            dy = other.y - m_y
+            distance = math.sqrt(dx ** 2 + dy ** 2)
+            if distance > max_distance:
+                continue
+
+            longitudinal, lateral = self.project_to_vehicle_frame(dx, dy, m_yaw)
+            if longitudinal <= 0 or abs(lateral) > half_width:
+                continue
+
+            heading_diff = abs(self.normalize_angle(getattr(other, 'yaw', 0.0) - m_yaw))
+            if heading_diff > max_heading_diff:
+                continue
+
+            if longitudinal < closest_longitudinal:
+                closest_vehicle = other
+                closest_longitudinal = longitudinal
+                closest_lateral = lateral
+
+        return closest_vehicle, closest_longitudinal, closest_lateral
+
+    def compute_side_clearance(self, m_x, m_y, m_yaw, direction, look_distance):
+        half_road_width = self.get_param("road_width") / 2.0
+        occupied = 0.0
+
+        for other in self.udp_client.get_neighbor_vehicle_state():
+            dx = other.x - m_x
+            dy = other.y - m_y
+            longitudinal, lateral = self.project_to_vehicle_frame(dx, dy, m_yaw)
+            if abs(longitudinal) > look_distance:
+                continue
+
+            if direction > 0 and lateral <= 0:
+                continue
+            if direction < 0 and lateral >= 0:
+                continue
+
+            occupied = max(occupied, abs(lateral) + self.get_param("vehicle_half_width"))
+
+        return max(half_road_width - occupied, 0.0)
+
+    def has_rear_space_for_escape(self, m_x, m_y, m_yaw):
+        for other in self.udp_client.get_neighbor_vehicle_state():
+            dx = other.x - m_x
+            dy = other.y - m_y
+            longitudinal, lateral = self.project_to_vehicle_frame(dx, dy, m_yaw)
+            if longitudinal >= 0:
+                continue
+
+            if abs(lateral) < self.get_param("vehicle_half_width") * 1.8 and abs(longitudinal) < self.get_param(
+                "rear_safety_distance"
+            ):
+                return False
+
+        return True
+
+    def choose_escape_direction(self, m_x, m_y, m_yaw):
+        left_clearance = self.compute_side_clearance(m_x, m_y, m_yaw, direction=1, look_distance=8.0)
+        right_clearance = self.compute_side_clearance(m_x, m_y, m_yaw, direction=-1, look_distance=8.0)
+        if left_clearance >= right_clearance:
+            return 1, left_clearance
+        return -1, right_clearance
+
+    def reset_escape_state(self):
+        self.blockage_start_time = None
+        self.escape_state = None
+        self.escape_state_start_time = None
+        self.escape_target_name = None
+
+    def persistent_blockage_recovery(self, m_x, m_y, m_yaw, v, w):
+        now = time.time()
+        blockage_distance = self.get_param("blockage_trigger_distance")
+        road_half_width = self.get_param("road_width") / 2.0
+        blockage_vehicle, front_gap, _ = self.find_closest_vehicle_in_corridor(
+            m_x,
+            m_y,
+            m_yaw,
+            max_distance=blockage_distance,
+            half_width=road_half_width,
+            max_heading_diff=math.radians(100.0),
+        )
+
+        if self.escape_state is not None:
+            if blockage_vehicle is None:
+                self.reset_escape_state()
+                return v, w
+
+            elapsed = now - self.escape_state_start_time
+            turn_rate = self.get_param("escape_turn_rate")
+
+            if self.escape_state == "reverse":
+                if elapsed < self.get_param("escape_reverse_duration"):
+                    return self.get_param("escape_reverse_speed"), -self.escape_direction * turn_rate
+                self.escape_state = "borrow"
+                self.escape_state_start_time = now
+                elapsed = 0.0
+
+            if self.escape_state == "borrow":
+                if elapsed < self.get_param("escape_borrow_duration"):
+                    return self.get_param("escape_forward_speed"), self.escape_direction * turn_rate
+                self.escape_state = "straighten"
+                self.escape_state_start_time = now
+                elapsed = 0.0
+
+            if self.escape_state == "straighten":
+                if elapsed < self.get_param("escape_straighten_duration"):
+                    return self.get_param("escape_forward_speed"), -self.escape_direction * turn_rate * 0.8
+                self.reset_escape_state()
+                return v, w
+
+        blocked = (
+            blockage_vehicle is not None
+            and front_gap < blockage_distance
+            and abs(v) <= self.get_param("blockage_speed_threshold")
+        )
+
+        if not blocked:
+            self.blockage_start_time = None
+            return v, w
+
+        front_speed = max(getattr(blockage_vehicle, "speed", 0.0), 0.0)
+        if front_speed > self.get_param("min_crawl_speed") * 1.2:
+            self.blockage_start_time = None
+            return v, w
+
+        if self.blockage_start_time is None:
+            self.blockage_start_time = now
+            self.escape_target_name = getattr(blockage_vehicle, "name", None)
+            return v, w
+
+        if now - self.blockage_start_time < self.get_param("blockage_timeout"):
+            return v, w
+
+        self.escape_direction, side_clearance = self.choose_escape_direction(m_x, m_y, m_yaw)
+        if side_clearance < self.get_param("escape_side_clearance_margin"):
+            return v, w
+
+        if not self.has_rear_space_for_escape(m_x, m_y, m_yaw):
+            return v, w
+
+        self.escape_state = "reverse"
+        self.escape_state_start_time = now
+        print(
+            f"Persistent blockage detected, starting recovery: direction={self.escape_direction}, "
+            f"clearance={side_clearance:.2f}"
+        )
+        return self.get_param("escape_reverse_speed"), -self.escape_direction * self.get_param("escape_turn_rate")
 
     def search_vehicle_initial_index(self):
         min_distance = float('inf')
@@ -219,28 +416,45 @@ class Control:
         self.targetPos_Info[1] = self.Y_points[target_pos_index]
 
     def obstacle_avoidance(self, m_x, m_y, m_yaw, v, w):
-        front_distance = 10.0
-        front_half_angle = math.radians(45.0)
-        neighbor_vehicle_data = self.udp_client.get_neighbor_vehicle_state()
+        front_vehicle, front_gap, lateral_offset = self.find_closest_vehicle_in_corridor(
+            m_x,
+            m_y,
+            m_yaw,
+            max_distance=15.0,
+            half_width=self.get_param("road_width") / 2.0,
+            max_heading_diff=math.radians(75.0),
+        )
 
-        for other_vehicle in neighbor_vehicle_data:
-            dx = other_vehicle.x - m_x
-            dy = other_vehicle.y - m_y
-            distance = math.sqrt(dx ** 2 + dy ** 2)
-            if distance > front_distance:
-                continue
+        if front_vehicle is None:
+            return v, w
 
-            target_yaw = math.atan2(dy, dx)
-            relative_angle = target_yaw - m_yaw
-            if relative_angle < -math.pi:
-                relative_angle += 2 * math.pi
-            elif relative_angle > math.pi:
-                relative_angle -= 2 * math.pi
+        front_speed = max(getattr(front_vehicle, 'speed', 0.0), 0.0)
+        same_lane_margin = self.get_param("vehicle_half_width") * 1.4
+        dynamic_follow_distance = max(4.0, self.m_v * self.get_param("follow_time_gap") + 2.0)
 
-            print("obstacle distance:", distance, "relative angle:", relative_angle)
-            if abs(relative_angle) <= front_half_angle:
-                print("front obstacle detected, stop")
-                return 0, 0
+        print(
+            f"front vehicle detected: gap={front_gap:.2f}, lateral={lateral_offset:.2f}, "
+            f"front_speed={front_speed:.2f}"
+        )
+
+        if abs(lateral_offset) > same_lane_margin:
+            return v, w
+
+        if front_gap < self.get_param("emergency_stop_distance"):
+            print("Front vehicle too close, emergency stop")
+            return 0, 0
+
+        if front_gap < dynamic_follow_distance:
+            follow_speed = min(v, max(front_speed - 0.3, self.get_param("min_crawl_speed")))
+            speed_scale = max(0.35, min(1.0, front_gap / dynamic_follow_distance))
+            adjusted_v = follow_speed * speed_scale
+            print(f"Front vehicle in narrow corridor, following at {adjusted_v:.2f}")
+            return adjusted_v, w
+
+        if front_gap < dynamic_follow_distance * 1.5 and front_speed < v:
+            adjusted_v = min(v, max(front_speed + 0.5, self.get_param("min_crawl_speed") * 1.5))
+            print(f"Front vehicle ahead, proactively slowing to {adjusted_v:.2f}")
+            return adjusted_v, w
         return v, w
 
     def lane_competition_avoidance(self, m_x, m_y, m_yaw, v, w):
@@ -268,7 +482,7 @@ class Control:
                 if my_priority > other_priority:
                     # 低优先级让行
                     print("Lane competition: yielding to higher priority vehicle")
-                    return max(v * 0.3, 2), w  # 减速让行
+                    return max(v * 0.3, self.get_param("min_crawl_speed")), w  # 减速让行
                 else:
                     # 高优先级维持速度
                     print("Lane competition: maintaining priority")
@@ -278,8 +492,8 @@ class Control:
 
     def following_conflict_avoidance(self, m_x, m_y, m_yaw, v, w):
         """跟车避障冲突解决：保持安全距离和预测性减速"""
-        safe_distance = 8.0  # 安全距离
-        warning_distance = 15.0  # 预警距离
+        safe_distance = self.get_param("safe_distance")
+        warning_distance = self.get_param("warning_distance")
         reaction_time = 1.5  # 反应时间
 
         neighbor_data = self.udp_client.get_neighbor_vehicle_state()
@@ -294,7 +508,7 @@ class Control:
             distance = math.sqrt(dx ** 2 + dy ** 2)
 
             # 检测前方车辆（相对角度小于30度）
-            relative_angle = math.atan2(dy, dx) - m_yaw
+            relative_angle = self.normalize_angle(math.atan2(dy, dx) - m_yaw)
             if abs(relative_angle) < math.radians(30) and distance < min_distance:
                 min_distance = distance
                 closest_vehicle = other
@@ -305,23 +519,24 @@ class Control:
             relative_speed = self.m_v - other_speed
 
             # 计算安全距离：d = v_rel * t_reaction + v_rel^2/(2*a_max)
-            dynamic_safe_distance = max(safe_distance, relative_speed * reaction_time)
+            dynamic_safe_distance = max(safe_distance, max(relative_speed, 0) * reaction_time)
 
             if min_distance < dynamic_safe_distance:
                 # 需要减速
-                if min_distance < safe_distance:
+                if min_distance < self.get_param("emergency_stop_distance"):
                     print(f"Following conflict: emergency braking! distance={min_distance:.2f}")
                     return 0, w  # 紧急停车
                 else:
                     # 平滑减速
-                    deceleration = (relative_speed ** 2) / (2 * (min_distance - safe_distance))
-                    new_v = max(0, self.m_v - deceleration * 0.1)
+                    distance_buffer = max(min_distance - safe_distance, 0.5)
+                    deceleration = (max(relative_speed, 0) ** 2) / (2 * distance_buffer)
+                    new_v = max(self.get_param("min_crawl_speed"), min(v, self.m_v - deceleration * 0.1))
                     print(f"Following conflict:减速 to {new_v:.2f}, distance={min_distance:.2f}")
                     return new_v, w
             elif min_distance < warning_distance and relative_speed > 0:
                 # 预警：轻踩刹车提示
                 print(f"Following conflict: warning, distance={min_distance:.2f}")
-                return v * 0.85, w
+                return max(self.get_param("min_crawl_speed"), v * 0.85), w
 
         return v, w
 
@@ -363,7 +578,7 @@ class Control:
 
                 if cross_product < 0:  # 右侧有车
                     print("Intersection: yielding to vehicle on right")
-                    return max(v * 0.2, 2), w
+                    return max(v * 0.2, self.get_param("min_crawl_speed")), w
                 elif my_time_to_intersection < 2.0:
                     # 快速通过路口
                     print("Intersection: passing through quickly")
@@ -373,8 +588,8 @@ class Control:
 
     def meeting_deadlock_resolution(self, m_x, m_y, m_yaw, v, w):
         """对向会车死锁解决：基于策略的让行机制"""
-        meeting_distance = 12.0
-        road_width = 3.0  # 道路宽度
+        meeting_distance = self.get_param("meeting_distance")
+        road_width = self.get_param("road_width")
 
         neighbor_data = self.udp_client.get_neighbor_vehicle_state()
         meeting_vehicle = None
@@ -389,7 +604,14 @@ class Control:
             other_yaw = getattr(other, 'yaw', 0)
             yaw_diff = abs((other_yaw - m_yaw) % (2 * math.pi))
 
-            if distance < meeting_distance and math.pi - 0.5 < yaw_diff < math.pi + 0.5:
+            longitudinal, lateral = self.project_to_vehicle_frame(dx, dy, m_yaw)
+
+            if (
+                distance < meeting_distance
+                and longitudinal > 0
+                and abs(lateral) < (road_width / 2.0 + 0.3)
+                and math.pi - 0.5 < yaw_diff < math.pi + 0.5
+            ):
                 meeting_vehicle = other
                 min_distance = distance
                 break
@@ -421,8 +643,9 @@ class Control:
                 self.deadlock_start_time = None
                 if min_distance < 5.0:
                     # 寻找避让点
-                    print("Meeting vehicle detected, slowing down to pass")
-                    return max(v * 0.3, 2), w
+                    cautious_speed = max(self.get_param("min_crawl_speed"), min(v * 0.25, 2.0))
+                    print("Meeting vehicle detected, creeping forward")
+                    return cautious_speed, w
 
         return v, w
 
