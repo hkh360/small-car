@@ -12,7 +12,7 @@ class Control:
         self.udp_send_port = 9001
         self.server_ip = '192.168.1.100'
 
-        net = "KmRzLF1R34PSDzlXgphCnddQ0HCI,192.168.112.1,6596,6597"
+        net = "KmRzLF1R34PSDzlXgphCnddQ0HCI,192.168.112.1,6720,6721"
         if net != "":
             net = net.split(",")
             self.vehicle_name = net[0]
@@ -127,6 +127,10 @@ class Control:
             "yield_timeout": 3.0,
             "deadlock_timeout": 3.0,
             "max_control_speed": 16.0,
+            "manual_relocate_distance": 6.0,
+            "route_relocalize_distance": 8.0,
+            "relocalize_recovery_duration": 1.2,
+            "relocalize_recovery_speed": 4.0,
         }
         self.deadlock_start_time = None
         self.blockage_start_time = None
@@ -144,10 +148,13 @@ class Control:
         self.curve_exit_lateral_error = 0.0
         self.filtered_steering_angle = 0.0
         self.last_path_w = 0.0
+        self.last_m_x = None
+        self.last_m_y = None
+        self.relocalize_recovery_until = 0.0
 
     def control_node(self):
         start_time = time.time()
-        self.load_route('exp_routes/Big.json')
+        self.load_route('exp_routes/rightInside.json')
 
         while True:
             vehicle_data = self.udp_client.get_vehicle_state()
@@ -155,6 +162,7 @@ class Control:
             self.m_y = vehicle_data.y
             self.m_yaw = vehicle_data.yaw / 180 * math.pi
             self.m_v = max(getattr(vehicle_data, 'speed', 0.0), 0.0)
+            self.detect_manual_relocation()
             self.update_vehpos_index()
             self.search_target_pos()
 
@@ -162,6 +170,7 @@ class Control:
             v, w = self.calc_pure_pursuit(self.m_x, self.m_y, self.m_yaw, self.targetPos_Info)
 
             v, w = self.apply_interaction_control(self.m_x, self.m_y, self.m_yaw, v, w)
+            v, w = self.apply_relocalize_recovery_limit(v, w)
             self.udp_client.send_control_command(v, w)
 
             elapsed_time = time.time() - start_time
@@ -336,6 +345,59 @@ class Control:
         while angle > math.pi:
             angle -= 2 * math.pi
         return angle
+
+    def detect_manual_relocation(self):
+        if self.last_m_x is None or self.last_m_y is None:
+            self.last_m_x = self.m_x
+            self.last_m_y = self.m_y
+            return
+
+        moved_distance = math.sqrt((self.m_x - self.last_m_x) ** 2 + (self.m_y - self.last_m_y) ** 2)
+        self.last_m_x = self.m_x
+        self.last_m_y = self.m_y
+
+        if moved_distance > self.get_param("manual_relocate_distance"):
+            print(f"Manual relocation detected: jump={moved_distance:.2f}, resetting controller state")
+            self.relocalize_to_route()
+
+    def reset_controller_state_after_relocation(self):
+        self.in_effective_curve = False
+        self.just_exited_curve = False
+        self.curve_exit_hold_until = 0.0
+        self.curve_exit_line = None
+        self.curve_exit_heading_error = 0.0
+        self.curve_exit_lateral_error = 0.0
+        self.filtered_steering_angle = 0.0
+        self.last_path_w = 0.0
+        self.lane_change_state = "checking"
+        self.lane_change_start_time = None
+        self.lane_change_direction = 0
+        self.lane_change_target_vehicle = None
+        self.blockage_start_time = None
+        self.deadlock_start_time = None
+        self.intersection_yield_start_time = None
+        self.reset_escape_state()
+        if hasattr(self, 'overtaking_state'):
+            delattr(self, 'overtaking_state')
+        if hasattr(self, 'overtaking_start_x'):
+            delattr(self, 'overtaking_start_x')
+
+    def relocalize_to_route(self):
+        self.search_vehicle_initial_index()
+        self.reset_controller_state_after_relocation()
+        self.relocalize_recovery_until = time.time() + self.get_param("relocalize_recovery_duration")
+        self.detect_upcoming_curve()
+        target_index = self.find_lookahead_index_by_distance(self.vehpos_initial_index, 6.0)
+        self.targetPos_Info[0] = self.X_points[target_index]
+        self.targetPos_Info[1] = self.Y_points[target_index]
+
+    def apply_relocalize_recovery_limit(self, v, w):
+        if time.time() >= self.relocalize_recovery_until:
+            return v, w
+
+        limited_v = min(v, self.get_param("relocalize_recovery_speed"))
+        limited_w = max(-0.25, min(0.25, w))
+        return limited_v, limited_w
 
     def check_lane_change_possible(self, m_x, m_y, m_yaw, direction):
         """检查是否可以变道"""
@@ -757,8 +819,11 @@ class Control:
                 min_distance = distance
                 nearest_index = find_index
 
-        if min_distance > 25:
+        if min_distance > self.get_param("route_relocalize_distance"):
+            print(f"Route relocalization: local route distance={min_distance:.2f}")
             self.search_vehicle_initial_index()
+            self.reset_controller_state_after_relocation()
+            self.relocalize_recovery_until = time.time() + self.get_param("relocalize_recovery_duration")
         else:
             self.vehpos_initial_index = nearest_index
 
